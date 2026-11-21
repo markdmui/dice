@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#110f0d">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Dice</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #110f0d; overflow: hidden; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; position: fixed; left: 0; top: 0; }
+  #trail { pointer-events: none; }
+  #mute { position: fixed; left: 2px; top: 2px; color: rgba(255,255,255,.3); padding: 10px; line-height: 0; }
+  #mute svg { width: 20px; height: 20px; pointer-events: none; fill: none; stroke: currentColor;
+    stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  #mute .off { display: none; }
+  #mute.muted .on { display: none; }
+  #mute.muted .off { display: inline; }
+  #start { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #fff; font: 600 22px "Segoe UI", system-ui, sans-serif; background: rgba(8,7,6,.6); letter-spacing: .03em; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
+  "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+} }
+</script>
+</head>
+<body>
+<canvas id="trail"></canvas>
+<div id="mute" class="muted"><svg viewBox="0 0 24 24"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5H4z"/><g class="on"><path d="M15.5 9a4.2 4.2 0 0 1 0 6"/><path d="M18 6.5a7.8 7.8 0 0 1 0 11"/></g><g class="off"><path d="M16 9.5l5 5"/><path d="M21 9.5l-5 5"/></g></svg></div>
+<div id="start">Tap to start</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import * as CANNON from 'cannon-es';
+
+// ---------- tuning ----------
+// 1 unit = one die (about 16 mm). Gravity is scaled to that size, a little gentler than real so rolls read well.
+const T = {
+  dicePerShort: 3,    // screen's short side = this many die widths (2.5x bigger than 7.5)
+  G: 420,             // gravity (units/s²)
+  ceiling: 3.5,       // invisible glass lid height
+  swipeGain: 1.15,    // die speed / finger speed
+  mouseGain: 2,       // a mouse drag is slower than a finger flick
+  lift: 0.22,         // upward pop from a swipe, per unit of speed
+  maxSpeed: 90,       // cap on a swipe's die speed (units/s)
+  hitRadius: 0.85,    // how close the finger path must pass (in die widths from the centre)
+  shakeMin: 11,       // phone acceleration (m/s², gravity removed) that counts as a shake
+  shakeForce: 0.55,   // how strongly the phone's motion throws the dice around
+};
+
+// ---------- renderer ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+const DPR = Math.min(window.devicePixelRatio || 1, 3);
+renderer.setPixelRatio(DPR);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.prepend(renderer.domElement);
+const maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+const scene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+function studio() {
+  const s = new THREE.Scene();
+  s.background = new THREE.Color(0x050506);
+  const box = (w, h, pos, col, k) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(col).multiplyScalar(k), side: THREE.DoubleSide }));
+    m.position.set(...pos); m.lookAt(0, 0, 0); s.add(m);
+  };
+  box(5, 2.2, [-5, 4.5, -3], 0xffffff, 3);
+  box(1.6, 5, [5, 3, 1], 0xfff0dd, 1.6);
+  box(14, 14, [0, 9, 0], 0x6c6f78, 1);
+  return s;
+}
+scene.environment = pmrem.fromScene(studio(), 0.04).texture;
+scene.environmentIntensity = 0.55;
+
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100);
+camera.up.set(0, 0, -1);
+camera.position.set(0, 40, 0);
+camera.lookAt(0, 0, 0);
+
+// ---------- lights ----------
+const key = new THREE.DirectionalLight(0xfff3e4, 2.3);
+key.position.set(-6, 30, -9);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.bias = -0.0005;
+key.shadow.normalBias = 0.02;
+key.shadow.radius = 3;
+scene.add(key); scene.add(key.target);
+scene.add(new THREE.HemisphereLight(0xdfe6ff, 0x1a120c, 0.5));
+
+// ---------- table (same dark top as Spinner) ----------
+function canvasTex(cv) {
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = maxAniso;
+  return t;
+}
+function tableTexture() {
+  const S = 1024, cv = document.createElement('canvas'); cv.width = cv.height = S;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#1d1915'; g.fillRect(0, 0, S, S);
+  const id = g.getImageData(0, 0, S, S), d = id.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const n = (Math.random() - 0.5) * 14;
+    d[i] += n; d[i + 1] += n; d[i + 2] += n;
+  }
+  g.putImageData(id, 0, 0);
+  const t = canvasTex(cv); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(8, 8);
+  return t;
+}
+const table = new THREE.Mesh(new THREE.PlaneGeometry(80, 80),
+  new THREE.MeshStandardMaterial({ map: tableTexture(), roughness: 0.92, metalness: 0 }));
+table.rotation.x = -Math.PI / 2; table.receiveShadow = true;
+scene.add(table);
+
+// ---------- dice ----------
+// BoxGeometry face order: +x, -x, +y, -y, +z, -z. Opposite faces add up to 7.
+const FACE_VALUES = [2, 5, 1, 6, 3, 4];
+const FACE_AXES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+const PIPS = {
+  1: [[.5, .5]],
+  2: [[.27, .27], [.73, .73]],
+  3: [[.27, .27], [.5, .5], [.73, .73]],
+  4: [[.27, .27], [.73, .27], [.27, .73], [.73, .73]],
+  5: [[.27, .27], [.73, .27], [.5, .5], [.27, .73], [.73, .73]],
+  6: [[.27, .25], [.73, .25], [.27, .5], [.73, .5], [.27, .75], [.73, .75]],
+};
+const faceTexSize = DPR >= 2 ? 512 : 256;
+function faceTexture(v) {
+  const S = faceTexSize, cv = document.createElement('canvas'); cv.width = cv.height = S;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#f2efe8'; g.fillRect(0, 0, S, S);
+  for (const [u, w] of PIPS[v]) {
+    const x = u * S, y = w * S, r = 0.088 * S;
+    const gr = g.createRadialGradient(x - r * 0.25, y - r * 0.25, r * 0.1, x, y, r);
+    gr.addColorStop(0, '#2a2a2c'); gr.addColorStop(0.8, '#141416'); gr.addColorStop(1, '#3a3a3c');
+    g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fillStyle = gr; g.fill();
+  }
+  return canvasTex(cv);
+}
+const dieMats = FACE_VALUES.map(v => new THREE.MeshPhysicalMaterial({
+  map: faceTexture(v), roughness: 0.38, metalness: 0, clearcoat: 0.5, clearcoatRoughness: 0.25,
+}));
+const dieGeo = new RoundedBoxGeometry(1, 1, 1, 6, 0.13);
+
+// ---------- physics world ----------
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -T.G, 0) });
+world.allowSleep = true;
+world.solver.iterations = 20;
+const mDie = new CANNON.Material('die'), mFloor = new CANNON.Material('floor'), mWall = new CANNON.Material('wall');
+world.addContactMaterial(new CANNON.ContactMaterial(mDie, mFloor, { friction: 0.32, restitution: 0.34 }));
+world.addContactMaterial(new CANNON.ContactMaterial(mDie, mWall, { friction: 0.12, restitution: 0.5 }));
+world.addContactMaterial(new CANNON.ContactMaterial(mDie, mDie, { friction: 0.2, restitution: 0.45 }));
+
+function plane(mat, euler, pos) {
+  const b = new CANNON.Body({ mass: 0, material: mat, shape: new CANNON.Plane() });
+  b.quaternion.setFromEuler(...euler);
+  b.position.set(...pos);
+  world.addBody(b);
+  return b;
+}
+const floor = plane(mFloor, [-Math.PI / 2, 0, 0], [0, 0, 0]);
+plane(mWall, [Math.PI / 2, 0, 0], [0, T.ceiling, 0]);       // glass lid
+const walls = {
+  left: plane(mWall, [0, Math.PI / 2, 0], [0, 0, 0]),
+  right: plane(mWall, [0, -Math.PI / 2, 0], [0, 0, 0]),
+  top: plane(mWall, [0, 0, 0], [0, 0, 0]),
+  bottom: plane(mWall, [0, Math.PI, 0], [0, 0, 0]),
+};
+
+const dice = [];
+for (let i = 0; i < 2; i++) {
+  const mesh = new THREE.Mesh(dieGeo, dieMats);
+  mesh.castShadow = true; mesh.receiveShadow = true;
+  scene.add(mesh);
+  const body = new CANNON.Body({
+    mass: 1, material: mDie, shape: new CANNON.Box(new CANNON.Vec3(0.5, 0.5, 0.5)),
+    linearDamping: 0.08, angularDamping: 0.12, sleepSpeedLimit: 0.15, sleepTimeLimit: 0.4,
+  });
+  const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+    (Math.random() * 4 | 0) * Math.PI / 2, Math.random() * Math.PI * 2, (Math.random() * 4 | 0) * Math.PI / 2));
+  body.quaternion.set(q.x, q.y, q.z, q.w);
+  body.position.set(i ? 0.55 : -0.55, 0.5, i ? 0.8 : -0.8);
+  world.addBody(body);
+  const die = { mesh, body, lastHit: 0, lastSound: 0 };
+  body.addEventListener('collide', e => onCollide(die, e));
+  dice.push(die);
+}
+const isDie = b => dice.some(d => d.body === b);
+
+// ---------- layout ----------
+const trail = document.getElementById('trail'), tctx = trail.getContext('2d');
+let W = 0, H = 0, ppu = 60, hx = 1, hz = 1;
+function layout() {
+  W = innerWidth; H = innerHeight;
+  renderer.setSize(W, H);
+  ppu = Math.min(W, H) / T.dicePerShort;
+  hx = W / 2 / ppu; hz = H / 2 / ppu;
+  Object.assign(camera, { left: -hx, right: hx, top: hz, bottom: -hz });
+  camera.updateProjectionMatrix();
+  const m = 0.04;                                   // dice stop just inside the screen edge
+  walls.left.position.set(-hx + m, 0, 0);
+  walls.right.position.set(hx - m, 0, 0);
+  walls.top.position.set(0, 0, -hz + m);
+  walls.bottom.position.set(0, 0, hz - m);
+  const sc = key.shadow.camera, e = Math.max(hx, hz) + 4;
+  Object.assign(sc, { left: -e, right: e, top: e, bottom: -e, near: 1, far: 80 });
+  sc.updateProjectionMatrix();
+  // keep dice on screen after a rotate or resize
+  for (const d of dice) {
+    const p = d.body.position;
+    p.x = Math.max(-hx + 0.6, Math.min(hx - 0.6, p.x));
+    p.z = Math.max(-hz + 0.6, Math.min(hz - 0.6, p.z));
+    d.body.wakeUp();
+  }
+  trail.width = W * DPR; trail.height = H * DPR; trail.style.width = W + 'px'; trail.style.height = H + 'px';
+  tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', layout); layout();
+const toScreen = p => ({ x: W / 2 + p.x * ppu, y: H / 2 + p.z * ppu });
+
+// ---------- audio ----------
+let ac = null, noiseBuf = null, master = null;
+function initAudio() {
+  if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+  ac = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  master = ac.createGain(); master.gain.value = muted ? 0 : 0.9; master.connect(ac.destination);
+  noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+  const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+}
+function noise(dur) { const s = ac.createBufferSource(); s.buffer = noiseBuf; s.start(ac.currentTime, Math.random() * 0.5, dur + 0.05); return s; }
+// hard plastic: die on die is a bright clack, die on table a duller knock
+function clack(vol, dieOnDie) {
+  if (!ac || muted) return;
+  const t = ac.currentTime;
+  const s = noise(0.05), bp = ac.createBiquadFilter(), gn = ac.createGain();
+  bp.type = 'bandpass'; bp.Q.value = dieOnDie ? 4 : 1.6;
+  bp.frequency.value = (dieOnDie ? 3600 : 1500) + Math.random() * 500;
+  gn.gain.setValueAtTime(vol * (dieOnDie ? 0.5 : 0.6), t); gn.gain.exponentialRampToValueAtTime(0.001, t + (dieOnDie ? 0.03 : 0.045));
+  s.connect(bp).connect(gn).connect(master);
+  const o = ac.createOscillator(), og = ac.createGain();
+  o.type = 'sine'; o.frequency.value = (dieOnDie ? 2400 : 520) + Math.random() * 120;
+  og.gain.setValueAtTime(vol * (dieOnDie ? 0.18 : 0.3), t); og.gain.exponentialRampToValueAtTime(0.001, t + (dieOnDie ? 0.025 : 0.05));
+  o.connect(og).connect(master); o.start(t); o.stop(t + 0.06);
+}
+const muteBtn = document.getElementById('mute');
+let muted = true;
+muteBtn.addEventListener('click', () => {
+  muted = !muted;
+  muteBtn.classList.toggle('muted', muted);
+  if (master) master.gain.value = muted ? 0 : 0.9;
+});
+let lastVib = 0;
+function buzz(ms) { if (navigator.vibrate) navigator.vibrate(ms); }
+
+function onCollide(die, e) {
+  const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
+  if (v < 2.5) return;
+  const now = performance.now();
+  if (now - die.lastSound < 35) return;
+  die.lastSound = now;
+  const dd = isDie(e.body);
+  clack(Math.min(1, v / 45), dd);
+  if (now - lastVib > 45) { buzz(Math.round(Math.min(14, 3 + v / 5))); lastVib = now; }
+}
+
+// ---------- throwing ----------
+const tmpV = new CANNON.Vec3();
+function wakeAll() { for (const d of dice) d.body.wakeUp(); settled = false; quietFor = 0; }
+
+// finger path crossed a die: throw it along the finger's direction
+function hitDie(d, vx, vz) {
+  const b = d.body;
+  let s = Math.hypot(vx, vz);
+  if (s < 1.5) return;
+  if (s > T.maxSpeed) { vx *= T.maxSpeed / s; vz *= T.maxSpeed / s; s = T.maxSpeed; }
+  b.wakeUp(); settled = false; quietFor = 0;
+  // never slow a die that is already moving faster the same way
+  const along = (b.velocity.x * vx + b.velocity.z * vz) / s;
+  if (along > s) return;
+  b.velocity.set(vx, Math.min(32, 2 + s * T.lift), vz);
+  // roll forward like a ball under a flick, plus some tumble
+  const r = 0.5, k = 0.55, j = () => (Math.random() - 0.5) * (6 + s * 0.25);
+  b.angularVelocity.set(vz / r * k + j(), j(), -vx / r * k + j());
+}
+
+// phone shake: dice feel the phone's motion the other way (they lag behind), plus a hop
+let shakeA = null, lastKick = 0;
+function kick(power) {
+  wakeAll();
+  for (const d of dice) {
+    const b = d.body, j = () => (Math.random() - 0.5);
+    b.velocity.y = Math.max(b.velocity.y, 10 + power * 22 * (0.6 + Math.random() * 0.4));
+    b.velocity.x += j() * 30 * power; b.velocity.z += j() * 30 * power;
+    b.angularVelocity.set(j() * 40 * power, j() * 30 * power, j() * 40 * power);
+  }
+}
+let hpX = 0, hpY = 0, hpZ = 0, gX = 0, gY = 0, gZ = 0;
+function onMotion(e) {
+  let ax, ay, az;
+  const a = e.acceleration;
+  if (a && a.x != null) { ax = a.x; ay = a.y; az = a.z; }
+  else if (e.accelerationIncludingGravity && e.accelerationIncludingGravity.x != null) {
+    const g = e.accelerationIncludingGravity;     // no gravity-free reading: take gravity out with a slow average
+    gX += (g.x - gX) * 0.1; gY += (g.y - gY) * 0.1; gZ += (g.z - gZ) * 0.1;
+    ax = g.x - gX; ay = g.y - gY; az = g.z - gZ;
+  } else return;
+  const mag = Math.hypot(ax, ay, az);
+  shakeA = { x: ax, y: ay, z: az, t: performance.now() };
+  if (!started) return;
+  if (mag > T.shakeMin) {
+    wakeAll();
+    const now = performance.now();
+    if (now - lastKick > 140) { lastKick = now; kick(Math.min(1, (mag - T.shakeMin) / 25 + 0.25)); }
+  }
+}
+addEventListener('devicemotion', onMotion);
+function applyShakeForce() {
+  if (!shakeA || performance.now() - shakeA.t > 80) return;
+  if (Math.hypot(shakeA.x, shakeA.y, shakeA.z) < T.shakeMin * 0.6) return;
+  const k = T.shakeForce * T.G / 9.81;
+  // phone x = screen right (+x), phone y = screen up (-z), phone z = out of the screen (+y)
+  tmpV.set(-shakeA.x * k, -shakeA.z * k, shakeA.y * k);
+  for (const d of dice) d.body.applyForce(tmpV);
+}
+
+// ---------- input ----------
+let finger = null;
+let trailPts = [];
+function fitVelocity(pts, windowMs) {
+  const tEnd = pts[pts.length - 1].t;
+  const w = pts.filter(p => tEnd - p.t <= windowMs);
+  if (w.length < 2) return { vx: 0, vy: 0 };
+  let st = 0, sx = 0, sy = 0, stt = 0, stx = 0, sty = 0; const n = w.length;
+  for (const p of w) { const t = (p.t - tEnd) / 1000; st += t; sx += p.x; sy += p.y; stt += t * t; stx += t * p.x; sty += t * p.y; }
+  const den = n * stt - st * st;
+  if (Math.abs(den) < 1e-12) return { vx: 0, vy: 0 };
+  return { vx: (n * stx - st * sx) / den, vy: (n * sty - st * sy) / den };
+}
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+  const t = L ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / L)) : 0;
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+function checkHits(a, b) {
+  const { vx, vy } = fitVelocity(finger.pts, 45);
+  const gain = (finger.mouse ? T.mouseGain : 1) * T.swipeGain / ppu;
+  const now = performance.now();
+  for (const d of dice) {
+    if (now - d.lastHit < 160) continue;
+    const c = toScreen(d.body.position);
+    if (segDist(c.x, c.y, a.x, a.y, b.x, b.y) < T.hitRadius * ppu) {
+      d.lastHit = now;
+      hitDie(d, vx * gain, vy * gain);
+    }
+  }
+}
+function addPoints(e) {
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+  const list = evs.length ? evs : [e];
+  for (const ev of list) {
+    const prev = finger.pts[finger.pts.length - 1];
+    const p = { x: ev.clientX, y: ev.clientY, t: ev.timeStamp };
+    finger.pts.push(p);
+    trailPts.push({ x: p.x, y: p.y, t: performance.now() });
+    if (prev) checkHits(prev, p);
+  }
+  if (finger.pts.length > 400) finger.pts.splice(0, finger.pts.length - 400);
+}
+addEventListener('pointerdown', e => {
+  if (!started || e.target.id === 'mute') return;
+  const mouse = e.pointerType === 'mouse';
+  if (mouse) {
+    if (e.button !== 0) return;
+    finger = null;
+    try { document.documentElement.setPointerCapture(e.pointerId); } catch {}
+  }
+  if (finger) return;
+  finger = { id: e.pointerId, pts: [], mouse };
+  trailPts = [];
+  addPoints(e);
+}, { passive: true });
+addEventListener('pointermove', e => {
+  if (!finger || e.pointerId !== finger.id) return;
+  addPoints(e);
+}, { passive: true });
+function endFinger(e, cancelled) {
+  if (!finger || e.pointerId !== finger.id) return;
+  if (!cancelled) addPoints(e);
+  const pts = finger.pts, a = pts[0], b = pts[pts.length - 1];
+  if (!cancelled && Math.hypot(b.x - a.x, b.y - a.y) <= 10 && b.t - a.t < 300) checkDoubleTap(b);
+  finger = null;
+}
+addEventListener('pointerup', e => endFinger(e, false), { passive: true });
+addEventListener('pointercancel', e => endFinger(e, true), { passive: true });
+addEventListener('contextmenu', e => e.preventDefault());
+addEventListener('keydown', e => { if (started && (e.key === 's' || e.key === 'S' || e.key === ' ')) kick(0.8); });
+
+// double tap off the dice: full screen on / off
+let lastTap = null;
+async function enterFullscreen() {
+  const el = document.documentElement;
+  try { if (el.requestFullscreen) await el.requestFullscreen({ navigationUI: 'hide' }); } catch {}
+  try { await screen.orientation.lock('portrait'); } catch {}
+}
+function checkDoubleTap(p) {
+  if (dice.some(d => { const c = toScreen(d.body.position); return Math.hypot(p.x - c.x, p.y - c.y) < ppu; })) { lastTap = null; return; }
+  if (lastTap && p.t - lastTap.t < 350 && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < 50) {
+    lastTap = null;
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else enterFullscreen();
+  } else lastTap = p;
+}
+
+// ---------- start (full screen, sound and motion unlock) ----------
+let started = false;
+document.getElementById('start').addEventListener('click', async () => {
+  initAudio();
+  try { if (window.DeviceMotionEvent && DeviceMotionEvent.requestPermission) await DeviceMotionEvent.requestPermission(); } catch {}
+  await enterFullscreen();
+  try { if (navigator.wakeLock) await navigator.wakeLock.request('screen'); } catch {}
+  document.getElementById('start').remove();
+  started = true; layout();
+});
+
+// ---------- settle: a die left leaning on another die or a wall gets a small nudge ----------
+const up = new THREE.Vector3(), qd = new THREE.Quaternion();
+function topValue(d) {
+  const q = d.body.quaternion; qd.set(q.x, q.y, q.z, q.w);
+  let best = -2, val = 0;
+  FACE_AXES.forEach((ax, i) => { up.set(...ax).applyQuaternion(qd); if (up.y > best) { best = up.y; val = FACE_VALUES[i]; } });
+  return { val, flat: best };
+}
+let settled = true, quietFor = 0;
+function checkSettle(dt) {
+  if (settled) return;
+  const still = dice.every(d => d.body.velocity.length() < 0.2 && d.body.angularVelocity.length() < 0.3);
+  quietFor = still ? quietFor + dt : 0;
+  if (quietFor < 0.35) return;
+  const cocked = dice.filter(d => topValue(d).flat < 0.97);
+  if (cocked.length) {
+    for (const d of cocked) { d.body.wakeUp(); d.body.velocity.set((Math.random() - 0.5) * 4, 9, (Math.random() - 0.5) * 4); d.body.angularVelocity.set((Math.random() - 0.5) * 12, 0, (Math.random() - 0.5) * 12); }
+    quietFor = 0; return;
+  }
+  settled = true;
+}
+
+// ---------- draw ----------
+function drawTrail(now) {
+  tctx.clearRect(0, 0, W, H);
+  const live = trailPts.filter(p => now - p.t < 220);
+  trailPts = live;
+  if (live.length < 2) return;
+  tctx.lineCap = 'round'; tctx.lineJoin = 'round';
+  for (let i = 1; i < live.length; i++) {
+    const a = live[i - 1], b = live[i], f = 1 - (now - b.t) / 220;
+    tctx.strokeStyle = `rgba(255,255,255,${0.4 * f})`;
+    tctx.lineWidth = 2 + 8 * f;
+    tctx.beginPath(); tctx.moveTo(a.x, a.y); tctx.lineTo(b.x, b.y); tctx.stroke();
+  }
+}
+
+const STEP = 1 / 240;
+let prev = performance.now();
+world.addEventListener('preStep', applyShakeForce);
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - prev) / 1000); prev = now;
+  world.step(STEP, dt, 12);
+  for (const d of dice) { d.mesh.position.copy(d.body.position); d.mesh.quaternion.copy(d.body.quaternion); }
+  checkSettle(dt);
+  drawTrail(now);
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(frame);
+window.__dice = { dice, world, kick, topValue, hitDie, ppu: () => ppu, toScreen, get settled() { return settled; } };
+</script>
+</body>
+</html>
