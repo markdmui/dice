@@ -52,8 +52,8 @@ import * as CANNON from 'cannon-es';
 // ---------- tuning ----------
 // 1 unit = one die (about 16 mm). Gravity is scaled to that size, a little gentler than real so rolls read well.
 const T = {
-  dicePerShort: 3,    // one die: screen's short side = this many die widths
-  shrinkPerDie: 0.9,  // each extra die makes all dice this much of the size before (5 dice = 66%)
+  dicePerShort: 3.333, // one die: screen's short side = this many die widths (120 px on a 400 px wide phone)
+  shrinkPerDie: 0.9036, // each extra die makes all dice this much of the size before (5 dice = 2/3 = 80 px)
   G: 200,             // gravity (units/s²): lower = floatier, longer rolls (was 420)
   ceiling: 6,         // invisible glass lid height
   swipeGain: 3.2,     // die speed / finger speed (first version 1.15)
@@ -230,7 +230,7 @@ function freeSpot() {
 }
 let diceCount = 2;
 try { diceCount = Math.min(5, Math.max(1, +localStorage.getItem('dice.count') || 2)); } catch {}
-// one die is full size; each extra die makes them all 10% smaller (the view zooms out, the physics stays the same)
+// one die is full size; each extra die makes them all about 10% smaller (the view zooms out, the physics stays the same)
 const sizeFor = n => Math.pow(T.shrinkPerDie, n - 1);
 function setDiceCount(n, drop) {
   while (dice.length > n) removeDie();
@@ -436,24 +436,14 @@ function addPoints(e) {
   }
   if (finger.pts.length > 400) finger.pts.splice(0, finger.pts.length - 400);
 }
-// two fingers pressed and held still: open the dice-count menu
-const touches = new Map();
-let holdTimer = 0;
-function cancelHold() { clearTimeout(holdTimer); holdTimer = 0; }
+// two fingers touch the screen: open the dice-count menu straight away
+const touches = new Set();
 addEventListener('pointerdown', e => {
   if (!started || menuOpen || e.pointerType !== 'touch') return;
-  touches.set(e.pointerId, { x0: e.clientX, y0: e.clientY });
-  cancelHold();
-  if (touches.size === 2) {
-    finger = null; trailPts = [];                    // a second finger means this is not a swipe
-    holdTimer = setTimeout(() => { holdTimer = 0; if (touches.size === 2) openMenu(); }, 450);
-  }
+  touches.add(e.pointerId);
+  if (touches.size >= 2) { finger = null; trailPts = []; touches.clear(); openMenu(); }
 }, { passive: true });
-addEventListener('pointermove', e => {
-  const t = touches.get(e.pointerId);
-  if (t && holdTimer && Math.hypot(e.clientX - t.x0, e.clientY - t.y0) > 24) cancelHold();
-}, { passive: true });
-const liftTouch = e => { if (touches.delete(e.pointerId)) cancelHold(); };
+const liftTouch = e => touches.delete(e.pointerId);
 addEventListener('pointerup', liftTouch, { passive: true });
 addEventListener('pointercancel', liftTouch, { passive: true });
 
