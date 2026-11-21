@@ -19,9 +19,11 @@
   #mute.muted .on { display: none; }
   #mute.muted .off { display: inline; }
   #menu { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
-    background: rgba(8,7,6,.62); opacity: 0; pointer-events: none; transition: opacity .15s; }
+    background: rgba(8,7,6,.78); opacity: 0; pointer-events: none; transition: opacity .15s; }
   #menu.open { opacity: 1; pointer-events: auto; }
+  #menu { flex-direction: column; }
   #menu .row { display: flex; }
+  #reload { margin-top: 26px; padding: 14px 28px; font: 15px "Segoe UI", system-ui, sans-serif; color: rgba(255,255,255,.45); }
   #menu .n { width: 64px; height: 72px; display: flex; align-items: center; justify-content: center;
     font: 300 34px "Segoe UI", system-ui, sans-serif; color: rgba(255,255,255,.4); }
   #menu .n.on { color: #fff; font-weight: 600; }
@@ -39,7 +41,7 @@
 <body>
 <canvas id="trail"></canvas>
 <div id="mute" class="muted"><svg viewBox="0 0 24 24"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5H4z"/><g class="on"><path d="M15.5 9a4.2 4.2 0 0 1 0 6"/><path d="M18 6.5a7.8 7.8 0 0 1 0 11"/></g><g class="off"><path d="M16 9.5l5 5"/><path d="M21 9.5l-5 5"/></g></svg></div>
-<div id="menu"><div class="row"></div></div>
+<div id="menu"><div class="row"></div><div id="reload">Reload</div></div>
 <div id="start">Tap to start</div>
 
 <script type="module">
@@ -50,7 +52,8 @@ import * as CANNON from 'cannon-es';
 // ---------- tuning ----------
 // 1 unit = one die (about 16 mm). Gravity is scaled to that size, a little gentler than real so rolls read well.
 const T = {
-  dicePerShort: 3,    // screen's short side = this many die widths (2.5x bigger than 7.5)
+  dicePerShort: 3,    // one die: screen's short side = this many die widths
+  shrinkPerDie: 0.9,  // each extra die makes all dice this much of the size before (5 dice = 66%)
   G: 200,             // gravity (units/s²): lower = floatier, longer rolls (was 420)
   ceiling: 6,         // invisible glass lid height
   swipeGain: 3.2,     // die speed / finger speed (first version 1.15)
@@ -227,8 +230,19 @@ function freeSpot() {
 }
 let diceCount = 2;
 try { diceCount = Math.min(5, Math.max(1, +localStorage.getItem('dice.count') || 2)); } catch {}
+// one die is full size; each extra die makes them all 10% smaller (the view zooms out, the physics stays the same)
+const sizeFor = n => Math.pow(T.shrinkPerDie, n - 1);
 function setDiceCount(n, drop) {
   while (dice.length > n) removeDie();
+  diceCount = n;
+  layout();
+  // fewer dice zooms in: a die pushed in from the edge may now overlap another, so give it a clear spot
+  dice.forEach((d, i) => {
+    const p = d.body.position;
+    if (dice.some((o, j) => j < i && Math.hypot(o.body.position.x - p.x, o.body.position.z - p.z) < 1.2)) {
+      const s = freeSpot(); p.set(s.x, 0.5, s.z);
+    }
+  });
   while (dice.length < n) {
     const p = freeSpot();
     const d = addDie(p.x, drop ? 2.2 : 0.5, p.z);
@@ -247,7 +261,7 @@ let W = 0, H = 0, ppu = 60, hx = 1, hz = 1;
 function layout() {
   W = innerWidth; H = innerHeight;
   renderer.setSize(W, H);
-  ppu = Math.min(W, H) / T.dicePerShort;
+  ppu = Math.min(W, H) / T.dicePerShort * sizeFor(diceCount);
   hx = W / 2 / ppu; hz = H / 2 / ppu;
   Object.assign(camera, { left: -hx, right: hx, top: hz, bottom: -hz });
   camera.updateProjectionMatrix();
@@ -450,6 +464,9 @@ for (let n = 1; n <= 5; n++) {
   b.addEventListener('click', () => { if (n !== diceCount) setDiceCount(n, true); closeMenu(); });
   menu.firstElementChild.appendChild(b);
 }
+// newest copy, not the phone's saved one: the count is kept in localStorage
+document.getElementById('reload').addEventListener('click', () => location.replace(location.pathname + '?r=' + Date.now()));
+if (location.search.includes('r=')) history.replaceState(null, '', location.pathname);
 function openMenu() {
   menuOpen = true; menuAt = performance.now(); finger = null; trailPts = [];
   for (const b of menu.querySelectorAll('.n')) b.classList.toggle('on', +b.dataset.n === diceCount);
