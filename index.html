@@ -65,6 +65,11 @@ const T = {
   shakeMin: 9,        // phone acceleration (m/s², gravity removed) that counts as a shake
   shakeForce: 2.6,    // how strongly the phone's motion throws the dice around (first version 0.55)
   shakeKick: 2,       // hop, throw and tumble from each shake jolt (1 = first version)
+  tiltDead: 4,        // degrees of tilt ignored (hand wobble)
+  tiltStart: 0.85,    // sideways pull just past the dead zone, as a share of gravity (dice break loose near 1)
+  tiltGain: 3,        // extra pull per unit of tilt past the dead zone
+  tiltMax: 2,         // cap on the sideways pull
+  tiltSmooth: 0.08,   // how fast the tilt reading follows the phone (lower = smoother, slower)
 };
 
 // ---------- renderer ----------
@@ -374,6 +379,7 @@ function onMotion(e) {
     gX += (g.x - gX) * 0.1; gY += (g.y - gY) * 0.1; gZ += (g.z - gZ) * 0.1;
     ax = g.x - gX; ay = g.y - gY; az = g.z - gZ;
   } else return;
+  readTilt(e.accelerationIncludingGravity);
   const mag = Math.hypot(ax, ay, az);
   shakeA = { x: ax, y: ay, z: az, t: performance.now() };
   if (!started) return;
@@ -384,6 +390,32 @@ function onMotion(e) {
   }
 }
 addEventListener('devicemotion', onMotion);
+
+// phone tilt: the tray tilts with the phone, so gravity leans and the dice roll downhill
+let tX = 0, tY = 0, tZ = 9.81, tiltSeen = false, tiltApplied = { x: 0, z: 0 };
+function readTilt(g) {
+  if (!g || g.x == null) return;
+  if (!tiltSeen) { tX = g.x; tY = g.y; tZ = g.z; tiltSeen = true; }
+  const k = T.tiltSmooth;
+  tX += (g.x - tX) * k; tY += (g.y - tY) * k; tZ += (g.z - tZ) * k;
+  setTilt(tX, tY, tZ);
+}
+// gx, gy, gz: the phone's gravity reading (points up out of a flat screen: 0, 0, +9.8)
+function setTilt(gx, gy, gz) {
+  const m = Math.hypot(gx, gy, gz) || 1;
+  const h = Math.hypot(gx, gy) / m;                       // sine of the tilt angle
+  const hd = Math.sin(T.tiltDead * Math.PI / 180);
+  // the physics' friction is stickier than real dice, so the pull starts near the break-loose point
+  const eff = h < hd ? 0 : Math.min(T.tiltMax, T.tiltStart + (h - hd) * T.tiltGain);
+  // downhill in world space: phone x = screen right (+x), phone y = screen top (-z)
+  const hx = h > 1e-6 ? -gx / m / h : 0, hz = h > 1e-6 ? gy / m / h : 0;
+  const nx = hx * eff * T.G, nz = hz * eff * T.G;
+  world.gravity.set(nx, -T.G, nz);
+  if (Math.hypot(nx - tiltApplied.x, nz - tiltApplied.z) > T.G * 0.02) {
+    tiltApplied = { x: nx, z: nz };
+    wakeAll();
+  }
+}
 function applyShakeForce() {
   if (!shakeA || performance.now() - shakeA.t > 80) return;
   if (Math.hypot(shakeA.x, shakeA.y, shakeA.z) < T.shakeMin * 0.6) return;
@@ -499,6 +531,16 @@ addEventListener('keydown', e => {
   else if (e.key === 'm' || e.key === 'M') menuOpen ? closeMenu() : openMenu();
   else if (e.key === 'Escape') closeMenu();
 });
+// PC test: hold the arrow keys to tilt the tray 20 degrees that way (the phone uses its sensor instead)
+const arrows = new Set();
+function keyTilt() {
+  const s = Math.sin(20 * Math.PI / 180) * 9.81, c = Math.cos(20 * Math.PI / 180) * 9.81;
+  const x = (arrows.has('ArrowLeft') ? 1 : 0) - (arrows.has('ArrowRight') ? 1 : 0);
+  const y = (arrows.has('ArrowDown') ? 1 : 0) - (arrows.has('ArrowUp') ? 1 : 0);
+  if (!x && !y) setTilt(0, 0, 9.81); else { const n = Math.hypot(x, y); setTilt(x / n * s, y / n * s, c); }
+}
+addEventListener('keydown', e => { if (e.key.startsWith('Arrow') && !tiltSeen) { arrows.add(e.key); keyTilt(); } });
+addEventListener('keyup', e => { if (arrows.delete(e.key)) keyTilt(); });
 
 // double tap off the dice: full screen on / off
 let lastTap = null;
@@ -600,7 +642,7 @@ function frame(now) {
   renderer.render(scene, camera);
 }
 requestAnimationFrame(frame);
-window.__dice = { dice, world, kick, setDiceCount, openMenu, get menuOpen() { return menuOpen; }, topValue, hitDie, ppu: () => ppu, toScreen, get settled() { return settled; } };
+window.__dice = { dice, world, kick, setDiceCount, openMenu, get menuOpen() { return menuOpen; }, topValue, hitDie, ppu: () => ppu, toScreen, get settled() { return settled; }, setTilt };
 </script>
 </body>
 </html>
