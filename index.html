@@ -65,9 +65,11 @@ const T = {
   shakeMin: 9,        // phone acceleration (m/s², gravity removed) that counts as a shake
   shakeForce: 2.6,    // how strongly the phone's motion throws the dice around (first version 0.55)
   shakeKick: 2,       // hop, throw and tumble from each shake jolt (1 = first version)
-  tiltDead: 4,        // degrees of tilt ignored (hand wobble)
-  tiltStart: 0.85,    // sideways pull just past the dead zone, as a share of gravity (dice break loose near 1)
-  tiltGain: 3,        // extra pull per unit of tilt past the dead zone
+  tiltDeadUp: 35,     // tilt toward you ignored up to this (normal holding angle); upright = full pull to the bottom
+  tiltDeadAway: 3,    // tipped past flat (top edge lower): pulls to the top almost at once
+  tiltDeadSide: 20,   // left / right tilt ignored up to this
+  tiltStart: 0.8,     // pull just past a dead zone, as a share of gravity (resting dice break loose near 1)
+  tiltGain: 1.6,      // extra pull per unit of tilt past the dead zone (upright = about 1.5)
   tiltMax: 2,         // cap on the sideways pull
   tiltSmooth: 0.08,   // how fast the tilt reading follows the phone (lower = smoother, slower)
 };
@@ -379,7 +381,7 @@ function onMotion(e) {
     gX += (g.x - gX) * 0.1; gY += (g.y - gY) * 0.1; gZ += (g.z - gZ) * 0.1;
     ax = g.x - gX; ay = g.y - gY; az = g.z - gZ;
   } else return;
-  readTilt(e.accelerationIncludingGravity);
+  readTilt(e.accelerationIncludingGravity, 'motion');
   const mag = Math.hypot(ax, ay, az);
   shakeA = { x: ax, y: ay, z: az, t: performance.now() };
   if (!started) return;
@@ -391,31 +393,45 @@ function onMotion(e) {
 }
 addEventListener('devicemotion', onMotion);
 
-// phone tilt: the tray tilts with the phone, so gravity leans and the dice roll downhill
-let tX = 0, tY = 0, tZ = 9.81, tiltSeen = false, tiltApplied = { x: 0, z: 0 };
-function readTilt(g) {
-  if (!g || g.x == null) return;
+// phone tilt: the tray tilts with the phone, so gravity leans and the dice drift downhill.
+// Held up facing you = dice drift to the bottom. Tipped past flat (top edge lower) = dice drift to the top.
+// Normal reading angles toward you do nothing.
+let tX = 0, tY = 0, tZ = 9.81, tiltSeen = false, tiltSrc = '-', tiltApplied = { x: 0, z: 0 };
+function readTilt(g, src) {
+  if (!g || g.x == null || (!g.x && !g.y && !g.z)) return;
+  if (src === 'orient' && tiltSrc === 'motion') return;   // the motion sensor wins when it works
   if (!tiltSeen) { tX = g.x; tY = g.y; tZ = g.z; tiltSeen = true; }
+  tiltSrc = src;
   const k = T.tiltSmooth;
   tX += (g.x - tX) * k; tY += (g.y - tY) * k; tZ += (g.z - tZ) * k;
   setTilt(tX, tY, tZ);
 }
+// backup source: the phone's angles (beta = front/back, gamma = left/right)
+addEventListener('deviceorientation', e => {
+  if (e.beta == null || e.gamma == null) return;
+  const b = e.beta * Math.PI / 180, c = e.gamma * Math.PI / 180;
+  readTilt({ x: -9.81 * Math.cos(b) * Math.sin(c), y: 9.81 * Math.sin(b), z: 9.81 * Math.cos(b) * Math.cos(c) }, 'orient');
+});
+const pull = (v, deadDeg) => {                               // v = sine of the tilt along one axis
+  const d = Math.sin(deadDeg * Math.PI / 180), a = Math.abs(v);
+  return a < d ? 0 : Math.sign(v) * Math.min(T.tiltMax, T.tiltStart + (a - d) * T.tiltGain);
+};
 // gx, gy, gz: the phone's gravity reading (points up out of a flat screen: 0, 0, +9.8)
 function setTilt(gx, gy, gz) {
   const m = Math.hypot(gx, gy, gz) || 1;
-  const h = Math.hypot(gx, gy) / m;                       // sine of the tilt angle
-  const hd = Math.sin(T.tiltDead * Math.PI / 180);
-  // the physics' friction is stickier than real dice, so the pull starts near the break-loose point
-  const eff = h < hd ? 0 : Math.min(T.tiltMax, T.tiltStart + (h - hd) * T.tiltGain);
-  // downhill in world space: phone x = screen right (+x), phone y = screen top (-z)
-  const hx = h > 1e-6 ? -gx / m / h : 0, hz = h > 1e-6 ? gy / m / h : 0;
-  const nx = hx * eff * T.G, nz = hz * eff * T.G;
+  const f = gy / m, sd = gx / m;                            // f > 0: top raised toward you; sd > 0: left edge down
+  const pz = pull(f, f > 0 ? T.tiltDeadUp : T.tiltDeadAway);
+  const px = -pull(sd, T.tiltDeadSide);
+  const nx = px * T.G, nz = pz * T.G;
   world.gravity.set(nx, -T.G, nz);
   if (Math.hypot(nx - tiltApplied.x, nz - tiltApplied.z) > T.G * 0.02) {
     tiltApplied = { x: nx, z: nz };
     wakeAll();
   }
+  if (dbg) dbg.textContent = `${tiltSrc}  g ${gx.toFixed(1)} ${gy.toFixed(1)} ${gz.toFixed(1)}  pull ${px.toFixed(2)} ${pz.toFixed(2)}`;
 }
+const dbg = /[?&]debug/.test(location.search) ? Object.assign(document.body.appendChild(document.createElement('div')),
+  { style: 'position:fixed;left:8px;bottom:8px;color:#888;font:12px monospace;z-index:9;pointer-events:none' }) : null;
 function applyShakeForce() {
   if (!shakeA || performance.now() - shakeA.t > 80) return;
   if (Math.hypot(shakeA.x, shakeA.y, shakeA.z) < T.shakeMin * 0.6) return;
@@ -531,10 +547,10 @@ addEventListener('keydown', e => {
   else if (e.key === 'm' || e.key === 'M') menuOpen ? closeMenu() : openMenu();
   else if (e.key === 'Escape') closeMenu();
 });
-// PC test: hold the arrow keys to tilt the tray 20 degrees that way (the phone uses its sensor instead)
+// PC test: hold the arrow keys to tilt the tray 60 degrees that way (the phone uses its sensor instead)
 const arrows = new Set();
 function keyTilt() {
-  const s = Math.sin(20 * Math.PI / 180) * 9.81, c = Math.cos(20 * Math.PI / 180) * 9.81;
+  const s = Math.sin(60 * Math.PI / 180) * 9.81, c = Math.cos(60 * Math.PI / 180) * 9.81;
   const x = (arrows.has('ArrowLeft') ? 1 : 0) - (arrows.has('ArrowRight') ? 1 : 0);
   const y = (arrows.has('ArrowDown') ? 1 : 0) - (arrows.has('ArrowUp') ? 1 : 0);
   if (!x && !y) setTilt(0, 0, 9.81); else { const n = Math.hypot(x, y); setTilt(x / n * s, y / n * s, c); }
